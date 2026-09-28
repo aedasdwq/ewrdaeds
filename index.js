@@ -222,7 +222,7 @@ async function sendUserLogs(bot, chatId, userId, limitOption = 30) {
   const logRef = db.ref(`users/${userId}/log`);
   const [logSnap, wdSnap, depSnap] = await Promise.all([
     limit === 'all' ? logRef.once('value') : logRef.limitToLast(limit).once('value'),
-    db.ref(`users/${userId}/wdHistory`).once('value'),
+    wdByUser(userId),
     db.ref(`users/${userId}/deposits`).once('value'),
   ]);
 
@@ -231,7 +231,7 @@ async function sendUserLogs(bot, chatId, userId, limitOption = 30) {
   const deposits = depSnap.val()  || {};
 
   const totalDep  = Object.values(deposits).reduce((s, d) => s + Number(d.amount || d.tonAdded || 0), 0);
-  const totalPaid = Object.values(wdHist).filter(w => w.status === 'paid').reduce((s, w) => s + Number(w.sentAmount || 0), 0);
+  const totalPaid = Object.values(wdHist).filter(w => w.status === 'paid').reduce((s, w) => s + Number(w.sentAmount || w.ton || 0), 0);
   const paidCount = Object.values(wdHist).filter(w => w.status === 'paid').length;
 
   let text =
@@ -311,6 +311,162 @@ let walletKey      = null;
 let walletAddress  = null;
 let isProcessing   = false;
 const processingQueue = new Set();
+
+// ==========================================================================
+// 🔹 Withdrawals data layer — reads/writes the SAME path the Mini App (server) uses:
+//        withdrawals/{userId}/{pushId}
+//    The engine works with a "composite id" = `${userId}_${pushId}` (Telegram user ids are numeric,
+//    so splitting on the first "_" is always safe), and with a normalized view of each record.
+//
+//    Status vocabulary:
+//      • Web-visible `status`  : pending | completed | rejected   (what the Mini App / Record page understand)
+//      • Engine-internal state : `botStatus` = pending | processing | awaiting_manual | awaiting_approval |
+//                                needs_review | bounced | failed | paid | cancelled
+//    The engine keeps using paid/cancelled/... internally; wdUpdate() translates to the web vocabulary.
+// ==========================================================================
+const REFUND_ON_CANCEL = true;   // give the user's TON back (users/{id}/tonBalance) when a withdrawal is cancelled/rejected
+
+function makeWdId(uid, key) { return `${uid}_${key}`; }
+function parseWdId(id) {
+  const s = String(id);
+  const i = s.indexOf('_');
+  if (i <= 0) throw new Error(`Bad withdrawal id: ${s}`);
+  return { uid: s.slice(0, i), key: s.slice(i + 1) };
+}
+
+function engineStatus(raw) {
+  const s = raw && raw.status;
+  if (s === 'completed') return 'paid';        // completed by the bot OR manually by the owner in the console
+  if (s === 'rejected')  return 'cancelled';
+  if (s === 'pending' || !s) return raw.botStatus || 'pending';
+  return s;                                     // legacy values written by the old bridge (paid, awaiting_manual, ...)
+}
+function publicStatus(engine) {
+  if (engine === 'paid') return 'completed';
+  if (engine === 'cancelled') return 'rejected';
+  return 'pending';
+}
+
+// web record → engine record
+function normalizeWd(uid, key, raw) {
+  const net = Number(raw.netAmount ?? raw.amount ?? raw.requestedAmount ?? 0);
+  return {
+    ...raw,
+    address: String(raw.walletAddress || raw.address || '').trim(),
+    ton:     net,                                 // what we actually send = amount AFTER the fee
+    userId:  String(uid),
+    wdId:    key,
+    status:  engineStatus(raw),
+    ts:      raw.ts || raw.timestamp || 0,
+  };
+}
+
+// Firebase-snapshot look-alikes so the rest of the code keeps working unchanged
+function wdSnapOf(obj) {
+  const o = obj || {};
+  const keys = Object.keys(o);
+  return {
+    val:    () => (keys.length ? o : null),
+    exists: () => keys.length > 0,
+    forEach: (fn) => { for (const k of keys) { if (fn({ key: k, val: () => o[k] }) === true) break; } return false; },
+  };
+}
+function flattenWithdrawals(tree) {
+  const out = {};
+  for (const [uid, list] of Object.entries(tree || {})) {
+    if (!list || typeof list !== 'object') continue;
+    for (const [key, raw] of Object.entries(list)) {
+      if (raw && typeof raw === 'object') out[makeWdId(uid, key)] = normalizeWd(uid, key, raw);
+    }
+  }
+  return out;
+}
+async function wdAll()          { return wdSnapOf(flattenWithdrawals((await db.ref('withdrawals').once('value')).val())); }
+async function wdByUser(uid)    { return wdSnapOf(flattenWithdrawals({ [uid]: (await db.ref(`withdrawals/${uid}`).once('value')).val() })); }
+async function wdByStatus(st)   {
+  const all = (await wdAll()).val() || {};
+  const out = {};
+  for (const [id, d] of Object.entries(all)) if (d.status === st) out[id] = d;
+  return wdSnapOf(out);
+}
+async function wdGet(id) {
+  const { uid, key } = parseWdId(id);
+  const raw = (await db.ref(`withdrawals/${uid}/${key}`).once('value')).val();
+  const one = raw ? { [id]: normalizeWd(uid, key, raw) } : null;
+  return { val: () => (one ? one[id] : null), exists: () => !!one };
+}
+
+// Write an engine patch. `status` is translated (status = web vocabulary, botStatus = engine state).
+async function wdUpdate(id, patch) {
+  const { uid, key } = parseWdId(id);
+  const ref = db.ref(`withdrawals/${uid}/${key}`);
+  const { noRefund, ...rest } = patch;
+  const out = { ...rest };
+
+  if (patch.status !== undefined) {
+    // never resurrect a record that was already refunded (would allow paying it AND keeping the refund)
+    if (['pending', 'processing'].includes(patch.status)) {
+      const cur = (await ref.child('refunded').once('value')).val();
+      if (cur) { console.log(`⛔ ${id} was already refunded — refusing to move it back to ${patch.status}`); return; }
+    }
+    out.botStatus = patch.status;
+    out.status    = publicStatus(patch.status);
+  }
+  if (noRefund) out.refundSkipped = true;
+
+  await ref.update(out);
+
+  if (patch.status === 'cancelled' && !noRefund) await wdRefund(uid, key).catch(e => console.log(`❌ refund ${id}: ${e.message}`));
+  if (patch.status === 'paid' || patch.status === 'cancelled') await wdSyncBalanceLog(uid, key, publicStatus(patch.status));
+}
+
+// Atomically claim a pending withdrawal (pending → processing). Returns true only for the winner.
+async function wdLock(id) {
+  const { uid, key } = parseWdId(id);
+  let locked = false;
+  await db.ref(`withdrawals/${uid}/${key}`).transaction((cur) => {
+    if (cur === null) return cur;                       // not in local cache yet → Firebase re-runs with the real value
+    if (engineStatus(cur) !== 'pending') return;        // abort: someone else took it / already final
+    locked = true;
+    return { ...cur, botStatus: 'processing', status: 'pending', updatedAt: Date.now(), attempts: (cur.attempts || 0) + 1 };
+  });
+  return locked;
+}
+
+// Give the money back exactly once (idempotent through the `refunded` flag)
+async function wdRefund(uid, key) {
+  if (!REFUND_ON_CANCEL) return;
+  const ref = db.ref(`withdrawals/${uid}/${key}`);
+  const flag = await ref.child('refunded').transaction((cur) => (cur ? undefined : true));
+  if (!flag.committed) return;                           // already refunded
+  const raw = (await ref.once('value')).val() || {};
+  const amt = Number(raw.requestedAmount ?? (Number(raw.netAmount ?? raw.amount ?? 0) + Number(raw.fee || 0)));
+  if (!(amt > 0)) { await ref.child('refunded').remove(); return; }
+  await db.ref(`users/${uid}/tonBalance`).transaction((cur) => Number(((Number(cur) || 0) + amt).toFixed(9)));
+  await ref.update({ refundedAmount: amt, refundedAt: Date.now() });
+  console.log(`💸 Refunded ${amt} TON to user ${uid} (withdrawal ${key})`);
+}
+
+// Keep balanceLogs/{uid} entry (written by the server with withdrawalId) in sync — best effort
+async function wdSyncBalanceLog(uid, key, status) {
+  try {
+    const snap = await db.ref(`balanceLogs/${uid}`).orderByChild('withdrawalId').equalTo(key).once('value');
+    const ups = {};
+    snap.forEach((c) => { ups[`${c.key}/status`] = status; });
+    if (Object.keys(ups).length) await db.ref(`balanceLogs/${uid}`).update(ups);
+  } catch (e) { /* non-critical */ }
+}
+
+// Old per-user history node is no longer used (the record itself lives in withdrawals/{uid}/{id})
+const wdHistoryRef = () => ({ update: async () => {} });
+
+// Debounced trigger so a burst of new records causes ONE processing cycle
+let _processTimer = null;
+function scheduleProcess(ms = 2000) {
+  if (_processTimer) return;
+  _processTimer = setTimeout(() => { _processTimer = null; processPendingWithdrawals(); }, ms);
+}
+
 let botInstance    = null;
 
 // ==========================
@@ -360,8 +516,7 @@ async function getUserDailyWithdrawalCount(userId) {
   try {
     const startOfDay = new Date();
     startOfDay.setHours(0, 0, 0, 0);
-    const snap = await db.ref("withdrawQueue")
-      .orderByChild("userId").equalTo(userId).once("value");
+    const snap = await wdByUser(userId);
     if (!snap.exists()) return 0;
     let count = 0;
     snap.forEach(child => {
@@ -580,25 +735,15 @@ async function sendChannelNotification(items, txHash) {
 // ==========================
 // 🔹 Update wdHistory
 // ==========================
-async function updateUserWdHistory(userId, wdId, txHash, amountTon) {
-  if (!userId || !wdId) return;
-  try {
-    await db.ref(`users/${userId}/wdHistory/${wdId}`).update({
-      status:      "paid",
-      txHash:      txHash || null,
-      sentAmount:  amountTon,
-      paidAt:      Date.now(),
-    });
-    console.log(`✅ wdHistory updated: users/${userId}/wdHistory/${wdId}`);
-  } catch (e) { console.log(`❌ updateUserWdHistory: ${e.message}`); }
-}
+// (kept for compatibility) — the paid state is now stored on withdrawals/{userId}/{id} by wdUpdate()
+async function updateUserWdHistory() {}
 
 // ==========================
 // 🔹 Validate withdrawal
 // ==========================
 async function validateWithdrawal(withdrawId, data) {
   if (!data?.address || (!data?.ton && !data?.amt)) {
-    await db.ref(`withdrawQueue/${withdrawId}`).update({ status: "failed", error: "Invalid data", updatedAt: Date.now() });
+    await wdUpdate(withdrawId, { status: "failed", error: "Invalid data", updatedAt: Date.now() });
     return { valid: false, skip: true };
   }
 
@@ -622,9 +767,9 @@ async function validateWithdrawal(withdrawId, data) {
 
   if (addrError) {
     console.log(`❌ Bad address [${withdrawId}]: ${addrError} | ${addr.substring(0, 30)}...`);
-    await db.ref(`withdrawQueue/${withdrawId}`).update({ status: "cancelled", error: addrError, updatedAt: Date.now() });
+    await wdUpdate(withdrawId, { status: "cancelled", error: addrError, updatedAt: Date.now() });
     if (userId && wdId) {
-      await db.ref(`users/${userId}/wdHistory/${wdId}`).update({ status: "cancelled", updatedAt: Date.now() }).catch(() => {});
+      await wdHistoryRef().update({ status: "cancelled", updatedAt: Date.now() }).catch(() => {});
     }
     if (botInstance) {
       await botInstance.sendMessage(ADMIN_CHAT_ID,
@@ -637,14 +782,14 @@ async function validateWithdrawal(withdrawId, data) {
   data.address = addr;
 
   if (userId && await isUserBanned(userId)) {
-    await db.ref(`withdrawQueue/${withdrawId}`).update({ status: "cancelled", error: "User is banned", updatedAt: Date.now() });
-    if (wdId) await db.ref(`users/${userId}/wdHistory/${wdId}`).update({ status: "cancelled", updatedAt: Date.now() });
+    await wdUpdate(withdrawId, { status: "cancelled", error: "User is banned", noRefund: true, updatedAt: Date.now() });
+    if (wdId) await wdHistoryRef().update({ status: "cancelled", updatedAt: Date.now() });
     return { valid: false, skip: true };
   }
 
   if (await isWalletBanned(data.address)) {
-    await db.ref(`withdrawQueue/${withdrawId}`).update({ status: "cancelled", error: "Wallet is banned", updatedAt: Date.now() });
-    if (userId && wdId) await db.ref(`users/${userId}/wdHistory/${wdId}`).update({ status: "cancelled", updatedAt: Date.now() });
+    await wdUpdate(withdrawId, { status: "cancelled", error: "Wallet is banned", noRefund: true, updatedAt: Date.now() });
+    if (userId && wdId) await wdHistoryRef().update({ status: "cancelled", updatedAt: Date.now() });
     return { valid: false, skip: true };
   }
 
@@ -659,7 +804,7 @@ async function validateWithdrawal(withdrawId, data) {
     const already = (data.status === 'awaiting_manual');
     if (!already) {
             const reason = `New withdrawal request — amount ${roundedAmount} TON — needs manual approval (all withdrawals require review)`;
-      await db.ref(`withdrawQueue/${withdrawId}`).update({
+      await wdUpdate(withdrawId, {
         status: 'awaiting_manual',
         updatedAt: Date.now(),
         holdReason: reason,
@@ -671,7 +816,7 @@ async function validateWithdrawal(withdrawId, data) {
     return { valid: false, skip: false };
   }
 
-  await db.ref(`withdrawQueue/${withdrawId}`).update({ error: null, lastError: null, updatedAt: Date.now() }).catch(() => {});
+  await wdUpdate(withdrawId, { error: null, lastError: null, updatedAt: Date.now() }).catch(() => {});
   return { valid: true, roundedAmount, userId, wdId };
 }
 
@@ -693,7 +838,7 @@ async function sendBatchTransfer(items, attempt = 0) {
     console.log(`⏭️ Insufficient balance for batch: ${balanceCheck.balance.toFixed(3)} TON < ${totalTON.toFixed(3)} TON`);
     for (const item of items) {
       processingQueue.delete(item.id);
-      await db.ref(`withdrawQueue/${item.id}`).update({
+      await wdUpdate(item.id, {
         status: "pending", updatedAt: Date.now(),
         lastError: `Insufficient balance: ${balanceCheck.balance.toFixed(3)} TON`
       }).catch(() => {});
@@ -722,9 +867,9 @@ async function sendBatchTransfer(items, attempt = 0) {
         const reason = addrErr.message || 'Invalid address';
         console.log(`❌ Bad address — cancelling ${item.id}: ${reason}`);
         invalidItems.push({ item, reason });
-        await db.ref(`withdrawQueue/${item.id}`).update({ status: "cancelled", updatedAt: Date.now(), error: `Bad address: ${reason}` }).catch(() => {});
+        await wdUpdate(item.id, { status: "cancelled", updatedAt: Date.now(), error: `Bad address: ${reason}` }).catch(() => {});
         if (item.userId && item.wdId) {
-          await db.ref(`users/${item.userId}/wdHistory/${item.wdId}`).update({ status: "cancelled", updatedAt: Date.now() }).catch(() => {});
+          await wdHistoryRef().update({ status: "cancelled", updatedAt: Date.now() }).catch(() => {});
         }
         processingQueue.delete(item.id);
       }
@@ -754,7 +899,7 @@ async function sendBatchTransfer(items, attempt = 0) {
     if (!recheck.sufficient) {
       for (const item of cleanItems) {
         processingQueue.delete(item.id);
-        await db.ref(`withdrawQueue/${item.id}`).update({ status: "pending", updatedAt: Date.now(), lastError: `Insufficient balance: ${recheck.balance.toFixed(3)} TON` }).catch(() => {});
+        await wdUpdate(item.id, { status: "pending", updatedAt: Date.now(), lastError: `Insufficient balance: ${recheck.balance.toFixed(3)} TON` }).catch(() => {});
       }
       return { success: false, reason: 'insufficient_balance' };
     }
@@ -768,7 +913,7 @@ async function sendBatchTransfer(items, attempt = 0) {
     if (!confirmation.confirmed) {
       console.log(`⚠️ Batch TIMEOUT — seqno ${seqno} not advanced. Marking as needs_review.`);
       for (const item of cleanItems) {
-        await db.ref(`withdrawQueue/${item.id}`).update({ status: "needs_review", updatedAt: Date.now(), lastError: `Batch timeout — seqno ${seqno} — verify manually`, batchSeqno: seqno }).catch(() => {});
+        await wdUpdate(item.id, { status: "needs_review", updatedAt: Date.now(), lastError: `Batch timeout — seqno ${seqno} — verify manually`, batchSeqno: seqno }).catch(() => {});
         processingQueue.delete(item.id);
       }
       if (botInstance) {
@@ -791,7 +936,7 @@ async function sendBatchTransfer(items, attempt = 0) {
 
     const updatePromises = cleanItems.map(async (item) => {
       try {
-        await db.ref(`withdrawQueue/${item.id}`).update({ status: "paid", updatedAt: Date.now(), completedAt: Date.now(), txHash: batchTxHash || null, sentAmount: item.roundedAmount, batchSize: cleanItems.length });
+        await wdUpdate(item.id, { status: "paid", updatedAt: Date.now(), completedAt: Date.now(), txHash: batchTxHash || null, sentAmount: item.roundedAmount, batchSize: cleanItems.length });
         await updateUserWdHistory(item.userId, item.wdId, batchTxHash, item.roundedAmount);
         processingQueue.delete(item.id);
         console.log(`   ✅ Marked paid: ${item.id}`);
@@ -819,7 +964,7 @@ async function sendBatchTransfer(items, attempt = 0) {
     }
     const revertList = (typeof cleanItems !== 'undefined') ? cleanItems : items;
     for (const item of revertList) {
-      await db.ref(`withdrawQueue/${item.id}`).update({ status: "pending", updatedAt: Date.now(), lastError: `Batch failed (attempt ${attempt + 1}): ${msg}`, attempts: (item.data.attempts || 0) + 1 }).catch(() => {});
+      await wdUpdate(item.id, { status: "pending", updatedAt: Date.now(), lastError: `Batch failed (attempt ${attempt + 1}): ${msg}`, attempts: (item.data.attempts || 0) + 1 }).catch(() => {});
       processingQueue.delete(item.id);
     }
     if (botInstance) {
@@ -843,7 +988,7 @@ async function sendSingleTransfer(item, attempt = 0) {
   const balanceCheck = await checkSufficientBalance(item.roundedAmount);
   if (!balanceCheck.sufficient) {
     processingQueue.delete(item.id);
-    await db.ref(`withdrawQueue/${item.id}`).update({ status: "pending", updatedAt: Date.now(), lastError: `Insufficient balance: ${balanceCheck.balance.toFixed(3)} TON` }).catch(() => {});
+    await wdUpdate(item.id, { status: "pending", updatedAt: Date.now(), lastError: `Insufficient balance: ${balanceCheck.balance.toFixed(3)} TON` }).catch(() => {});
     return { success: false, reason: 'insufficient_balance' };
   }
 
@@ -858,7 +1003,7 @@ async function sendSingleTransfer(item, attempt = 0) {
     const confirmation = await confirmBatchTransaction(seqno, 90000);
     if (!confirmation.confirmed) {
       console.log(`⚠️ Single TIMEOUT — seqno ${seqno}`);
-      await db.ref(`withdrawQueue/${item.id}`).update({ status: "needs_review", updatedAt: Date.now(), lastError: `Single timeout — seqno ${seqno} — verify manually` }).catch(() => {});
+      await wdUpdate(item.id, { status: "needs_review", updatedAt: Date.now(), lastError: `Single timeout — seqno ${seqno} — verify manually` }).catch(() => {});
       processingQueue.delete(item.id);
       if (botInstance) {
                   await botInstance.sendMessage(ADMIN_CHAT_ID, `⚠️ <b>Single Timeout</b>\n\n<code>${item.id}</code>\nSeqno: <code>${seqno}</code>\nReview manually`, { parse_mode: 'HTML' }).catch(() => {});
@@ -873,7 +1018,7 @@ async function sendSingleTransfer(item, attempt = 0) {
       txHash = txData.result?.[0]?.transaction_id?.hash || null;
     } catch(e) {}
 
-    await db.ref(`withdrawQueue/${item.id}`).update({ status: "paid", updatedAt: Date.now(), completedAt: Date.now(), txHash: txHash || null, sentAmount: item.roundedAmount, batchSize: 1 });
+    await wdUpdate(item.id, { status: "paid", updatedAt: Date.now(), completedAt: Date.now(), txHash: txHash || null, sentAmount: item.roundedAmount, batchSize: 1 });
     await updateUserWdHistory(item.userId, item.wdId, txHash, item.roundedAmount);
     processingQueue.delete(item.id);
     console.log(`✅ Single paid: ${item.id} | hash: ${txHash ? txHash.substring(0,12)+'...' : 'N/A'}`);
@@ -893,7 +1038,7 @@ async function sendSingleTransfer(item, attempt = 0) {
       await new Promise(r => setTimeout(r, waitSec * 1000));
       return sendSingleTransfer(item, attempt + 1);
     }
-    await db.ref(`withdrawQueue/${item.id}`).update({ status: "pending", updatedAt: Date.now(), lastError: `Single failed (${attempt + 1}): ${msg}`, attempts: (item.data.attempts || 0) + 1 }).catch(() => {});
+    await wdUpdate(item.id, { status: "pending", updatedAt: Date.now(), lastError: `Single failed (${attempt + 1}): ${msg}`, attempts: (item.data.attempts || 0) + 1 }).catch(() => {});
     processingQueue.delete(item.id);
     return { success: false, reason: 'error', error: msg };
   }
@@ -911,7 +1056,7 @@ async function processPendingWithdrawals() {
     isProcessing = true;
     await unlockExpiredDailyLimits();
 
-    const snapshot    = await db.ref("withdrawQueue").orderByChild("status").equalTo("pending").once("value");
+    const snapshot    = await wdByStatus("pending");
     const withdrawals = snapshot.val();
     if (!withdrawals) { console.log("📭 No pending withdrawals"); isProcessing = false; return; }
 
@@ -932,12 +1077,7 @@ async function processPendingWithdrawals() {
       const validation = await validateWithdrawal(id, data);
       if (!validation.valid) { processingQueue.delete(id); continue; }
 
-      let locked = false;
-      await db.ref(`withdrawQueue/${id}`).transaction((current) => {
-        if (!current || current.status !== "pending") return;
-        locked = true;
-        return { ...current, status: "processing", updatedAt: Date.now(), attempts: (current.attempts || 0) + 1 };
-      });
+      const locked = await wdLock(id);
 
       if (!locked) { console.log(`⏭️ ${id} already taken — skipping`); processingQueue.delete(id); continue; }
 
@@ -959,14 +1099,14 @@ async function processPendingWithdrawals() {
 // ==========================
 async function unlockExpiredDailyLimits() {
   try {
-    const snap  = await db.ref("withdrawQueue").orderByChild("status").equalTo("awaiting_approval").once("value");
+    const snap  = await wdByStatus("awaiting_approval");
     const items = snap.val();
     if (!items) return;
     const now = Date.now();
     let unlocked = 0;
     for (const [id, d] of Object.entries(items)) {
       if (d.unlockAt && now >= d.unlockAt) {
-        await db.ref(`withdrawQueue/${id}`).update({ status: "pending", updatedAt: now, holdReason: null, unlockAt: null, lastError: null });
+        await wdUpdate(id, { status: "pending", updatedAt: now, holdReason: null, unlockAt: null, lastError: null });
         unlocked++;
         console.log(`🔓 Unlocked daily-limit withdrawal: ${id}`);
       }
@@ -1255,10 +1395,10 @@ function startWelcomeBot() {
     if (!isAdmin(msg)) { await unauth(msg); return; }
     try {
       const [snapP, snapM, snapA, snapR] = await Promise.all([
-        db.ref("withdrawQueue").orderByChild("status").equalTo("pending").once("value"),
-        db.ref("withdrawQueue").orderByChild("status").equalTo("awaiting_manual").once("value"),
-        db.ref("withdrawQueue").orderByChild("status").equalTo("awaiting_approval").once("value"),
-        db.ref("withdrawQueue").orderByChild("status").equalTo("processing").once("value"),
+        wdByStatus("pending"),
+        wdByStatus("awaiting_manual"),
+        wdByStatus("awaiting_approval"),
+        wdByStatus("processing"),
       ]);
       const pendingItems = snapP.exists() ? snapP.val() : {};
       const manualItems  = snapM.exists() ? snapM.val() : {};
@@ -1303,7 +1443,7 @@ function startWelcomeBot() {
   bot.onText(/\/stats/, async (msg) => {
     if (!isAdmin(msg)) { await unauth(msg); return; }
     try {
-      const snap  = await db.ref("withdrawQueue").once("value");
+      const snap  = await wdAll();
       const items = snap.val() || {};
       const counts = { pending: 0, processing: 0, paid: 0, failed: 0, bounced: 0, cancelled: 0, awaiting_approval: 0, awaiting_manual: 0, needs_review: 0 };
       let totalPaid = 0;
@@ -1386,13 +1526,11 @@ function startWelcomeBot() {
   bot.onText(/\/retryall/, async (msg) => {
     if (!isAdmin(msg)) { await unauth(msg); return; }
     try {
-      const snap  = await db.ref("withdrawQueue").orderByChild("status").equalTo("failed").once("value");
+      const snap  = await wdByStatus("failed");
       const items = snap.val();
             if (!items) { await adminReply(bot, msg.chat.id, "📭 No failed withdrawals"); return; }
       const count = Object.keys(items).length;
-      const updates = {};
-      Object.keys(items).forEach(id => { updates[`${id}/status`] = "pending"; updates[`${id}/updatedAt`] = Date.now(); updates[`${id}/lastError`] = null; updates[`${id}/attempts`] = 0; });
-      await db.ref("withdrawQueue").update(updates);
+      for (const id of Object.keys(items)) await wdUpdate(id, { status: "pending", updatedAt: Date.now(), lastError: null, attempts: 0 });
             await adminReply(bot, msg.chat.id, `🔄 Requeued <b>${count}</b> failed withdrawal(s) for processing`);
       setTimeout(() => processPendingWithdrawals(), 1000);
     } catch(e) { await adminReply(bot, msg.chat.id, `❌ ${e.message}`); }
@@ -1439,7 +1577,7 @@ function startWelcomeBot() {
     try {
       const [bannedSnap, wdSnap, depositsSnap, referralsSnap, userSnap] = await Promise.all([
         db.ref(`bannedUsers/${userId}`).once("value"),
-        db.ref("withdrawQueue").orderByChild("userId").equalTo(userId).once("value"),
+        wdByUser(userId),
         db.ref(`users/${userId}/deposits`).once("value"),
         db.ref(`users/${userId}/referrals`).once("value"),
         db.ref(`users/${userId}`).once("value"),
@@ -1626,10 +1764,10 @@ function startWelcomeBot() {
     let totalPaidTon = 0;
     let paidCount = 0;
     try {
-      const wdSnap = await db.ref(`users/${userId}/wdHistory`).once('value');
+      const wdSnap = await wdByUser(userId);
       const wds = Object.values(wdSnap.val() || {});
       const paid = wds.filter(w => w.status === 'paid');
-      totalPaidTon = paid.reduce((s, w) => s + (Number(w.sentAmount || 0)), 0);
+      totalPaidTon = paid.reduce((s, w) => s + (Number(w.sentAmount || w.ton || 0)), 0);
       paidCount = paid.length;
     } catch(e) {}
 
@@ -1732,10 +1870,10 @@ function startWelcomeBot() {
             // processing or awaiting_approval it will still show as "pending" on the dashboard even if
             // the (old) /pending_wd says "nothing here" because it only looked at awaiting_manual.
       const [snapManual, snapApproval, snapPending, snapProcessing] = await Promise.all([
-        db.ref('withdrawQueue').orderByChild('status').equalTo('awaiting_manual').once('value'),
-        db.ref('withdrawQueue').orderByChild('status').equalTo('awaiting_approval').once('value'),
-        db.ref('withdrawQueue').orderByChild('status').equalTo('pending').once('value'),
-        db.ref('withdrawQueue').orderByChild('status').equalTo('processing').once('value'),
+        wdByStatus("awaiting_manual"),
+        wdByStatus("awaiting_approval"),
+        wdByStatus("pending"),
+        wdByStatus("processing"),
       ]);
 
       const toList = (snap) => Object.entries(snap.val() || {}).map(([id, d]) => ({ id, ...d }));
@@ -1840,11 +1978,13 @@ function startWelcomeBot() {
 
             await adminReply(bot, msg.chat.id, `👥 Fetched ${Object.keys(allUsers).length} user(s) — calculating...`);
 
+      const wdsByUser = {};
+      Object.values((await wdAll()).val() || {}).forEach(w => { (wdsByUser[w.userId] = wdsByUser[w.userId] || {})[w.wdId] = w; });
       const userStats = [];
       for (const [userId, userData] of Object.entries(allUsers)) {
         const referrals     = userData.referrals     || {};
         const deposits      = userData.deposits      || {};
-        const wdHistory     = userData.wdHistory     || {};
+        const wdHistory     = wdsByUser[userId] || {};
 
         const totalReferrals = Object.keys(referrals).length;
         if (totalReferrals === 0) continue;
@@ -1869,7 +2009,7 @@ function startWelcomeBot() {
 
                 // Total withdrawals
         const paidWds = Object.values(wdHistory).filter(w => w.status === 'paid');
-        const totalWithdrawTon = paidWds.reduce((s, w) => s + (Number(w.sentAmount) || 0), 0);
+        const totalWithdrawTon = paidWds.reduce((s, w) => s + (Number(w.sentAmount || w.ton) || 0), 0);
 
         userStats.push({
           userId,
@@ -1915,7 +2055,7 @@ function startWelcomeBot() {
   bot.onText(/\/lastpaid/, async (msg) => {
     if (!isAdmin(msg)) { await unauth(msg); return; }
     try {
-      const snap  = await db.ref("withdrawQueue").orderByChild("status").equalTo("paid").once("value");
+      const snap  = await wdByStatus("paid");
       const items = snap.val();
             if (!items) { await adminReply(bot, msg.chat.id, "📭 No paid withdrawals yet"); return; }
 
@@ -1979,7 +2119,7 @@ function startWelcomeBot() {
     if (!isAdmin(msg)) { await unauth(msg); return; }
     try {
             await adminReply(bot, msg.chat.id, "🔍 Checking pending withdrawals for fraud...");
-      const snap  = await db.ref("withdrawQueue").once("value");
+      const snap  = await wdAll();
       const items = snap.val();
             if (!items) { await adminReply(bot, msg.chat.id, "📭 No withdrawals in the queue"); return; }
       const walletUsers = {};
@@ -2013,7 +2153,7 @@ function startWelcomeBot() {
   bot.onText(/\/awaiting_queue/, async (msg) => {
     if (!isAdmin(msg)) { await unauth(msg); return; }
     try {
-      const snap  = await db.ref("withdrawQueue").orderByChild("status").equalTo("awaiting_approval").once("value");
+      const snap  = await wdByStatus("awaiting_approval");
       const items = snap.val();
             if (!items) { await adminReply(bot, msg.chat.id, "📭 No withdrawals currently pending due to the daily limit"); return; }
 
@@ -2052,7 +2192,7 @@ function startWelcomeBot() {
   bot.onText(/\/unlock(?:\s+(\d+))?/, async (msg, match) => {
     if (!isAdmin(msg)) { await unauth(msg); return; }
     try {
-      const snap  = await db.ref("withdrawQueue").orderByChild("status").equalTo("awaiting_approval").once("value");
+      const snap  = await wdByStatus("awaiting_approval");
       const items = snap.val();
             if (!items) { await adminReply(bot, msg.chat.id, "📭 No withdrawals awaiting daily approval"); return; }
 
@@ -2066,7 +2206,7 @@ function startWelcomeBot() {
       let unlocked = 0;
       const now = Date.now();
       for (const w of toUnlock) {
-        await db.ref(`withdrawQueue/${w.id}`).update({
+        await wdUpdate(w.id, {
           status:    "pending",
           updatedAt: now,
           holdReason: null,
@@ -2091,7 +2231,7 @@ function startWelcomeBot() {
   bot.onText(/\/pending_reasons/, async (msg) => {
     if (!isAdmin(msg)) { await unauth(msg); return; }
     try {
-      const snap  = await db.ref("withdrawQueue").orderByChild("status").once("value");
+      const snap  = await wdAll();
       const items = snap.val();
             if (!items) { await adminReply(bot, msg.chat.id, "📭 No withdrawals"); return; }
       const held = Object.entries(items).map(([id, d]) => ({ id, ...d })).filter(w => ['pending', 'awaiting_approval', 'awaiting_manual', 'processing'].includes(w.status)).sort((a, b) => (a.ts || 0) - (b.ts || 0));
@@ -2625,10 +2765,10 @@ function startWelcomeBot() {
     if (data.startsWith('manual_approve:')) {
       const withdrawId = data.replace('manual_approve:', '').trim();
       try {
-        const snap = await db.ref(`withdrawQueue/${withdrawId}`).once('value');
+        const snap = await wdGet(withdrawId);
         const wd   = snap.val();
                 if (!wd) { await bot.answerCallbackQuery(query.id, { text: '❌ Withdrawal not found!' }); return; }
-        await db.ref(`withdrawQueue/${withdrawId}`).update({
+        await wdUpdate(withdrawId, {
           status: 'pending', approvedByAdmin: true, updatedAt: Date.now(), holdReason: null, unlockAt: null, lastError: null
         });
                 // Advance to the next in the session
@@ -2671,14 +2811,14 @@ function startWelcomeBot() {
     if (data.startsWith('manual_reject:')) {
       const withdrawId = data.replace('manual_reject:', '').trim();
       try {
-        const snap = await db.ref(`withdrawQueue/${withdrawId}`).once('value');
+        const snap = await wdGet(withdrawId);
         const wd   = snap.val();
                 if (!wd) { await bot.answerCallbackQuery(query.id, { text: '❌ Withdrawal not found!' }); return; }
-        await db.ref(`withdrawQueue/${withdrawId}`).update({
+        await wdUpdate(withdrawId, {
                     status: 'cancelled', updatedAt: Date.now(), holdReason: 'Rejected manually by admin'
         });
         if (wd.userId && wd.wdId) {
-          await db.ref(`users/${wd.userId}/wdHistory/${wd.wdId}`).update({ status: 'cancelled', updatedAt: Date.now() }).catch(() => {});
+          await wdHistoryRef().update({ status: 'cancelled', updatedAt: Date.now() }).catch(() => {});
         }
         const state = manualReviewState[chatId];
         if (state) state.index++;
@@ -2753,10 +2893,10 @@ function startWelcomeBot() {
     if (data.startsWith('reprocess_wd:')) {
       const withdrawId = data.replace('reprocess_wd:', '').trim();
       try {
-        const snap = await db.ref(`withdrawQueue/${withdrawId}`).once("value");
+        const snap = await wdGet(withdrawId);
         const wd   = snap.val();
                 if (!wd) { await bot.answerCallbackQuery(query.id, { text: "❌ Withdrawal not found!" }); return; }
-        await db.ref(`withdrawQueue/${withdrawId}`).update({ status: "pending", updatedAt: Date.now(), lastError: null });
+        await wdUpdate(withdrawId, { status: "pending", updatedAt: Date.now(), lastError: null });
                 await bot.editMessageText(query.message.text + `\n\n🔄 <b>Re-added for processing</b>`, { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: { inline_keyboard: [] } });
                 await bot.answerCallbackQuery(query.id, { text: "🔄 Re-added to the queue" });
         setTimeout(() => processPendingWithdrawals(), 1000);
@@ -2766,11 +2906,11 @@ function startWelcomeBot() {
     if (data.startsWith('approve_wd:')) {
       const withdrawId = data.replace('approve_wd:', '').trim();
       try {
-        const snap = await db.ref(`withdrawQueue/${withdrawId}`).once("value");
+        const snap = await wdGet(withdrawId);
         const wd   = snap.val();
                 if (!wd) { await bot.answerCallbackQuery(query.id, { text: "❌ Withdrawal not found!" }); return; }
                 if (!['awaiting_approval', 'awaiting_manual'].includes(wd.status)) { await bot.answerCallbackQuery(query.id, { text: `⚠️ Current status: ${wd.status}` }); return; }
-        await db.ref(`withdrawQueue/${withdrawId}`).update({ status: "pending", approvedByAdmin: true, updatedAt: Date.now(), holdReason: null, unlockAt: null, lastError: null });
+        await wdUpdate(withdrawId, { status: "pending", approvedByAdmin: true, updatedAt: Date.now(), holdReason: null, unlockAt: null, lastError: null });
                 await bot.editMessageText(query.message.text + `\n\n✅ <b>Approved</b> — paying now...`, { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: { inline_keyboard: [] } });
                 await bot.answerCallbackQuery(query.id, { text: "✅ Approved — payment will be sent now" });
         setTimeout(() => processPendingWithdrawals(), 1000);
@@ -2780,12 +2920,12 @@ function startWelcomeBot() {
     if (data.startsWith('reject_wd:')) {
       const withdrawId = data.replace('reject_wd:', '').trim();
       try {
-        const snap = await db.ref(`withdrawQueue/${withdrawId}`).once("value");
+        const snap = await wdGet(withdrawId);
         const wd   = snap.val();
                 if (!wd) { await bot.answerCallbackQuery(query.id, { text: "❌ Withdrawal not found!" }); return; }
                 if (!['awaiting_approval', 'awaiting_manual'].includes(wd.status)) { await bot.answerCallbackQuery(query.id, { text: `⚠️ Current status: ${wd.status}` }); return; }
-                await db.ref(`withdrawQueue/${withdrawId}`).update({ status: "cancelled", updatedAt: Date.now(), holdReason: "Rejected by admin" });
-        if (wd.userId && wd.wdId) await db.ref(`users/${wd.userId}/wdHistory/${wd.wdId}`).update({ status: "cancelled", updatedAt: Date.now() });
+                await wdUpdate(withdrawId, { status: "cancelled", updatedAt: Date.now(), holdReason: "Rejected by admin" });
+        if (wd.userId && wd.wdId) await wdHistoryRef().update({ status: "cancelled", updatedAt: Date.now() });
                 await bot.editMessageText(query.message.text + `\n\n❌ <b>Rejected and cancelled</b>`, { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: { inline_keyboard: [] } });
                 await bot.answerCallbackQuery(query.id, { text: "❌ Withdrawal rejected and cancelled" });
             } catch (e) { await bot.answerCallbackQuery(query.id, { text: `❌ Error: ${e.message}` }); }
@@ -2803,14 +2943,14 @@ setInterval(async () => {
   if (systemPaused) return;
   if (!WITHDRAWAL_ENABLED) return;
   try {
-    const snap = await db.ref("withdrawQueue").orderByChild("status").equalTo("processing").once("value");
+    const snap = await wdByStatus("processing");
     const items = snap.val();
     if (!items) return;
     const stuckThreshold = Date.now() - 5 * 60 * 1000;
     let recovered = 0;
     for (const [id, data] of Object.entries(items)) {
       if ((data.updatedAt || 0) < stuckThreshold) {
-        await db.ref(`withdrawQueue/${id}`).update({ status: "pending", updatedAt: Date.now(), lastError: "Recovered from stuck processing state" });
+        await wdUpdate(id, { status: "pending", updatedAt: Date.now(), lastError: "Recovered from stuck processing state" });
         processingQueue.delete(id);
         console.log(`♻️ Recovered stuck withdrawal: ${id}`);
         recovered++;
@@ -2825,7 +2965,7 @@ setInterval(async () => {
 // ==========================
 setInterval(async () => {
   if (!systemPaused && !isProcessing && WITHDRAWAL_ENABLED) {
-    const snap = await db.ref("withdrawQueue").orderByChild("status").equalTo("pending").once("value").catch(() => null);
+    const snap = await wdByStatus("pending").catch(() => null);
     if (snap && snap.exists()) { console.log(`⏰ Flush timer — running batch process`); processPendingWithdrawals(); }
   }
 }, BATCH_FLUSH_SECONDS * 1000);
@@ -2862,85 +3002,28 @@ setInterval(async () => {
   if (!systemPaused && WITHDRAWAL_ENABLED) await processPendingWithdrawals();
 }, 60 * 1000);
 
-db.ref("withdrawQueue").on("child_added", async (snap) => {
-  if (systemPaused) return;
-  if (!WITHDRAWAL_ENABLED) return;
-  const data = snap.val();
-  if (data?.status === "pending" && !processingQueue.has(snap.key)) {
-    console.log(`📢 New withdrawal: ${snap.key}`);
-    setTimeout(() => processPendingWithdrawals(), 2000);
-  }
-});
 
 // ==========================
-// 🔹 Bridge: withdrawals/{userId}/{id}  →  withdrawQueue/{id}
-//    The Mini App writes withdrawal requests to the path "withdrawals/{userId}/{id}"
-//    which is completely different from the one our processing engine reads from ("withdrawQueue").
-//    This code "mirrors" any new pending request into withdrawQueue with the same id,
-//    so it goes through the same verification and payment engine, and then reflects the status update
-//    (paid / cancelled / failed / ...) back to the original path so the Mini App displays it correctly.
+// 🔹 Live watcher on withdrawals/{userId}/{id}
+//    The Mini App writes requests here and the payout engine reads AND updates the very same record
+//    (status: pending → completed / rejected), so there is no second path and no bridge anymore.
 // ==========================
-function mapLegacyWithdrawal(userId, id, data) {
-  const amount = Number(data.netAmount ?? data.amount ?? data.requestedAmount ?? 0);
-  return {
-    address: String(data.walletAddress || data.address || '').trim(),
-    ton: amount,
-    userId,
-    wdId: id,
-    ts: data.ts || data.timestamp || Date.now(),
-    status: "pending",
-    srcPath: `withdrawals/${userId}/${id}`,
-  };
-}
-
-function watchLegacyWithdrawals() {
+function watchWithdrawals() {
   db.ref("withdrawals").on("child_added", (userSnap) => {
-    const userId = userSnap.key;
-
-    userSnap.ref.on("child_added", async (wSnap) => {
-      const id   = wSnap.key;
-      const data = wSnap.val();
-      if (!data || data.status !== "pending" || data.mirrored) return;
-
-      try {
-        const qRef = db.ref(`withdrawQueue/${id}`);
-        const existing = (await qRef.once("value")).val();
-        if (existing) { await wSnap.ref.update({ mirrored: true }).catch(() => {}); return; }
-
-        const mapped = mapLegacyWithdrawal(userId, id, data);
-        if (!mapped.address || !mapped.ton) {
-          console.log(`⚠️ Legacy withdrawal ${id} skipped — missing address/amount`);
-          return;
-        }
-
-        await qRef.set(mapped);
-        await wSnap.ref.update({ mirrored: true }).catch(() => {});
-        console.log(`🔗 Mirrored legacy withdrawal ${id} (user ${userId}) → withdrawQueue`);
-        setTimeout(() => processPendingWithdrawals(), 1500);
-      } catch (e) {
-        console.log(`❌ mirror error [${id}]: ${e.message}`);
+    const uid = userSnap.key;
+    userSnap.ref.on("child_added", (wSnap) => {
+      if (systemPaused || !WITHDRAWAL_ENABLED) return;
+      const raw = wSnap.val();
+      if (!raw || typeof raw !== 'object') return;
+      const id = makeWdId(uid, wSnap.key);
+      if (engineStatus(raw) === 'pending' && !processingQueue.has(id)) {
+        console.log(`📢 New withdrawal: ${id}`);
+        scheduleProcess(2000);
       }
     });
   });
 }
-
-// Sync the payment status back from withdrawQueue to the original path withdrawals/{userId}/{id}
-db.ref("withdrawQueue").on("child_changed", async (snap) => {
-  const data = snap.val();
-  if (!data?.srcPath || !data?.status) return;
-  try {
-    await db.ref(data.srcPath).update({
-      status: data.status,
-      txHash: data.txHash || null,
-      lastError: data.lastError || data.error || null,
-      updatedAt: Date.now(),
-    });
-  } catch (e) {
-    console.log(`❌ sync-back error [${snap.key}]: ${e.message}`);
-  }
-});
-
-watchLegacyWithdrawals();
+watchWithdrawals();
 
 db.ref(".info/connected").on("value", (snap) => { if (snap.val()) console.log("📡 Firebase connected"); });
 
